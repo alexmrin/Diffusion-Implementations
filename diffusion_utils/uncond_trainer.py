@@ -1,6 +1,9 @@
 import os
+import math
 from copy import deepcopy
 import yaml
+import time
+
 import torch
 import torch.nn as nn
 from torch.nn.utils import clip_grad_norm_
@@ -13,18 +16,15 @@ from models.torch_utils import update_ema
 from datasets.cifar10 import prepare_cifar10_loader
 
 def load_config(config_path):
-    with open(config_path, 'r') as file:
-        config = yaml.safe_load(file)
-    return config
+    try:
+        with open(config_path, 'r') as file:
+            config = yaml.safe_load(file)
+        return config
+    except Exception as e:
+        raise ValueError(f"Error loading configuration file: {e}")
 
-def train(config_path):
-    # Load configuration
-    cfg = load_config(config_path)
-
-    # Initialize wandb
-    wandb.init(project=cfg['project_name'], config=cfg)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    betas = get_named_beta_schedule("linear", 1000)
+def initialize_model(cfg):
+    model = Unet(**cfg['model_cfg'])
     optimizer = torch.optim.AdamW(
         params=model.parameters(),
         lr=cfg['training_cfg']['learning_rate'],
@@ -32,12 +32,38 @@ def train(config_path):
         eps=cfg['training_cfg']['epsilon'],
         weight_decay=cfg['training_cfg']['weight_decay']
     )
-    scheduler = LambdaLR(optimizer, lr_lambda=lambda step: cfg['training_cfg']['scheduler_lambda'])
-    model = Unet(**cfg['model_cfg'])
+    def warmup_scheduler(step, total_steps):
+        warmup_steps = int(total_steps * cfg['training_cfg']['warmup_prop'])
+        if step < warmup_steps:
+            return cfg['training_cfg']["min_lr"] / cfg['training_cfg']["learning_rate"] + (1 - cfg['training_cfg']["min_lr"] / cfg['training_cfg']["learning_rate"]) * (step / warmup_steps)
+        else:
+            progress = (step - warmup_steps) / (total_steps - warmup_steps)
+            cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
+            return ((cfg['training_cfg']["learning_rate"] - cfg['training_cfg']["min_lr"]) * cosine_decay + cfg['training_cfg']["min_lr"]) / cfg['training_cfg']["learning_rate"]
+    scheduler = LambdaLR(optimizer, lr_lambda=lambda step: warmup_scheduler(step, cfg['training_cfg']['max_steps']))
     ema_params = deepcopy(model.state_dict())
+    return model, optimizer, scheduler, ema_params
+
+def train(config_path):
+    torch.backends.cuda.matmul.allow_tf32 = True
+    
+    # Load configuration
+    cfg = load_config(config_path)
+
+    # Initialize wandb
+    wandb.init(project=cfg['project_name'], config=cfg)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    betas = get_named_beta_schedule(cfg['training_cfg']['schedule_name'], cfg['model_cfg']['t_max'])
+
+    model, optimizer, scheduler, ema_params = initialize_model(cfg)
     gaussian_diffusion = GaussianDiffusion(betas=betas)
 
-    # Log the model configuration
+    print("Compiling model...")
+    model = torch.compile(model)
+    
+    # Mixed precision scaler
+    scaler = torch.cuda.amp.GradScaler()
+
     wandb.watch(model)
 
     # Loading the information from the checkpoint file
@@ -49,6 +75,8 @@ def train(config_path):
     # Preparing the data
     train_loader, val_loader = prepare_cifar10_loader(batch_size=cfg['training_cfg']['batch_size'])
     model.to(device)
+    print("Starting training...")
+    loop_start = time.time()
 
     while True:
         for images, _ in train_loader:
@@ -56,16 +84,22 @@ def train(config_path):
                 save_checkpoint(model, optimizer, scheduler, step, ema_params, cfg['training_cfg']['checkpoint_pth'])
                 print("Training Complete.")
                 return 0
+            start_time = time.time()
             images = images.to(device)
             optimizer.zero_grad()
-            x_ts, ts, noise = gaussian_diffusion.sample_x_ts(images)
-            loss = gaussian_diffusion.calculate_loss(model, x_ts, ts, noise)
-            loss.backward()
-            optimizer.step()
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                x_ts, ts, noise = gaussian_diffusion.sample_x_ts(images)
+                loss = gaussian_diffusion.calculate_loss(model, x_ts, ts, noise)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            clip_grad_norm_(model.parameters(), cfg['training_cfg']['grad_norm'])
+            scaler.step(optimizer)
+            scaler.update()
+            loss /= cfg['training_cfg']['batch_size']
             update_ema(ema_params, model.state_dict())
+            print(f"Step {step}: Time elapsed: {loop_start-time.time()}s")
 
-            # Log training metrics
-            wandb.log({"train_loss": loss.item(), "step": step})
+            wandb.log({"train_loss": loss.item(), "step": step, "step_time": start_time-time.time()})
 
             if step % cfg['training_cfg']['log_interval'] == 0:
                 validate(model, val_loader, ema_params, gaussian_diffusion, device)
@@ -76,14 +110,15 @@ def validate(model, val_loader, ema_params, gaussian_diffusion, device):
     model.eval()
     original = model.state_dict()
     model.load_state_dict(ema_params).to(device)
-    
+
     val_loss = 0
     with torch.no_grad():
         for images, _ in val_loader:
             images = images.to(device)
-            x_ts, ts, noise = gaussian_diffusion.sample_x_ts(images)
-            loss = gaussian_diffusion.calculate_loss(model, x_ts, ts, noise)
-            val_loss += loss.item()
+            with torch.cuda.amp.autocast():
+                x_ts, ts, noise = gaussian_diffusion.sample_x_ts(images)
+                loss = gaussian_diffusion.calculate_loss(model, x_ts, ts, noise)
+            val_loss += loss.item() / images.shape[0]
 
     val_loss /= len(val_loader)
 
@@ -107,14 +142,14 @@ def save_checkpoint(model, optimizer, scheduler, step, ema_params, path="checkpo
     wandb.save(path)
 
 def load_checkpoint(
+    load_pth: str,
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler._LRScheduler,
-    load_pth: str
+    scheduler: torch.optim.lr_scheduler._LRScheduler
 ):
     checkpoint = torch.load(load_pth)
-    model.load_state_dict(checkpoint["model_raw"])
-    ema_dict = checkpoint["model_ema"]
+    model.load_state_dict(checkpoint["model"])
+    ema_dict = checkpoint["ema_params"]
     optimizer.load_state_dict(checkpoint["optimizer"])
     scheduler.load_state_dict(checkpoint["scheduler"])
     step = checkpoint["step"]
