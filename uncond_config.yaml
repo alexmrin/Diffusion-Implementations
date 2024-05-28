@@ -1,0 +1,29 @@
+project_name: "Diffusion"
+run_name: "DDPM-CIFAR10-64-linear"
+model_cfg:
+  in_channels: 3
+  out_channels: 3
+  channels: 192
+  n_res_blocks: 2
+  attention_levels: [1, 2, 3]
+  channel_multipliers: [1, 2, 3, 4]
+  channels_per_head: 64
+  tf_layers: 2
+  t_max: 1000
+training_cfg:
+  batch_size: 128
+  max_steps: 250000
+  log_interval: 250
+  save_every: 2500
+  checkpoint_pth: "checkpoint.pth"
+  min_lr: 0.00003
+  learning_rate: 0.0003
+  weight_decay: 0.01
+  beta1: 0.9
+  beta2: 0.999
+  epsilon: 0.00000001
+  grad_norm: 1.0
+  schedule_name: "linear"
+  warmup_prop: 0.05
+  dry_run: false
+  compile: true

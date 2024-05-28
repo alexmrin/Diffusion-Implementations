@@ -3,8 +3,8 @@ from typing import List
 import torch
 import torch.nn as nn
 
-from torch_utils import linear, conv_nd
-from modules import (
+from models.torch_utils import linear, conv_nd
+from models.modules import (
     Upsample,
     Downsample,
     SpatialTransformer,

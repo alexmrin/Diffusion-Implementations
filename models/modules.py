@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from torch_utils import conv_nd, avg_pool_nd, linear
+from models.torch_utils import conv_nd, avg_pool_nd, linear
 
 class Downsample(nn.Module):
     def __init__(self, channels, use_conv=True):

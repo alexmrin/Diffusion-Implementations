@@ -3,3 +3,5 @@ torchvision
 wandb
 PyYAML
 matplotlib
+kaggle
+datasets
